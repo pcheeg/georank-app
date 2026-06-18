@@ -1,4 +1,4 @@
-/* GeoRank v0.1 */
+/* GeoRank v0.5 balanced hotfix */
 
 const START_DATE_UTC = Date.UTC(2026, 5, 17, 0, 0, 0); // 17 June 2026 00:00 GMT
 const DAY_MS = 86400000;
@@ -21,6 +21,20 @@ const OCEANIA_COUNTRIES = new Set([
   "Australia", "Fiji", "Kiribati", "Marshall Islands", "Micronesia", "Nauru",
   "New Zealand", "Palau", "Papua New Guinea", "Samoa", "Solomon Islands",
   "Tonga", "Tuvalu", "Vanuatu"
+]);
+const GENERATOR_RULE_CHANGE_PUZZLE_NO = 3; // Keep GeoRank #1 and #2 exactly as originally generated.
+const GLOBAL_EXCLUDED_COUNTRIES = new Set([
+  "South Africa",
+  "Bolivia",
+  "Eswatini",
+  "Sri Lanka",
+  "Ivory Coast"
+]);
+const FLAG_DAY_EXCLUDED_COUNTRIES = new Set([
+  "Chad",
+  "Romania",
+  "Monaco",
+  "Indonesia"
 ]);
 const FLAG_FORBIDDEN_PAIRS = [
   ["Chad", "Romania"],
@@ -121,8 +135,13 @@ function nextResetText() {
 }
 
 function referenceCandidatesForPuzzleNo(puzzleNo) {
-  const wellKnown = COUNTRIES_CLEAN.filter(c => GOOD_REFERENCE_CAPITALS.has(c.capital) && !WEAK_REFERENCE_CAPITALS.has(c.capital));
-  const hard = COUNTRIES_CLEAN.filter(c => HARD_REFERENCE_CAPITALS.has(c.capital) && !WEAK_REFERENCE_CAPITALS.has(c.capital));
+  const allowed = c => {
+    if (WEAK_REFERENCE_CAPITALS.has(c.capital)) return false;
+    if (puzzleNo >= GENERATOR_RULE_CHANGE_PUZZLE_NO && GLOBAL_EXCLUDED_COUNTRIES.has(c.country)) return false;
+    return true;
+  };
+  const wellKnown = COUNTRIES_CLEAN.filter(c => allowed(c) && GOOD_REFERENCE_CAPITALS.has(c.capital));
+  const hard = COUNTRIES_CLEAN.filter(c => allowed(c) && HARD_REFERENCE_CAPITALS.has(c.capital));
   const useWellKnown = mulberry32(hashString(`GeoRank:referenceTier:${puzzleNo}`))() < 0.5;
   const combined = useWellKnown ? [...wellKnown, ...hard] : [...hard, ...wellKnown];
   return combined
@@ -144,22 +163,62 @@ function referenceForPuzzleNo(puzzleNo) {
 
 function makeDistancePuzzle(rng, puzzleNo, excludeCountries = new Set()) {
   const reference = referenceForPuzzleNo(puzzleNo);
+  const enhancedRules = puzzleNo >= GENERATOR_RULE_CHANGE_PUZZLE_NO;
   let best = null;
-  for (let attempt = 0; attempt < 800; attempt++) {
-    const candidates = shuffle(COUNTRIES_CLEAN.filter(c => c.country !== reference.country && !excludeCountries.has(c.country)), rng).slice(0, 10);
+
+  for (let attempt = 0; attempt < 1000; attempt++) {
+    let candidates;
+
+    if (enhancedRules) {
+      // Use familiar anchors: 4 easy / 4 medium / 2 hard where possible.
+      candidates = difficultySample(rng, { easy: 4, medium: 4, hard: 2, veryHard: 0 }, excludeCountries)
+        .filter(c => c.country !== reference.country);
+      while (candidates.length < 10) {
+        const extra = sample(COUNTRIES_CLEAN.filter(c => c.country !== reference.country && !excludeCountries.has(c.country)), rng);
+        if (!candidates.some(x => x.country === extra.country)) candidates.push(extra);
+      }
+      candidates = candidates.slice(0, 10);
+    } else {
+      candidates = shuffle(COUNTRIES_CLEAN.filter(c => c.country !== reference.country && !excludeCountries.has(c.country)), rng).slice(0, 10);
+    }
+
     const items = candidates.map(c => ({...c, value: haversineKm(reference, c)}));
+    if (items.length !== 10) continue;
     if (!passesOceaniaLimit(items)) continue;
     if (new Set(items.map(i => Math.round(i.value))).size < 10) continue;
+
     const sorted = [...items].sort((a,b) => a.value - b.value);
     const gaps = sorted.slice(1).map((x,i) => x.value - sorted[i].value);
+
+    // Reject "coin-flip" pairs: virtually identical distance from the reference,
+    // but the two capitals themselves are not naturally comparable/local neighbours.
+    // Close calls like Vienna vs Bern are allowed because the cities are near each other.
+    const artificialCoinFlips = sorted.slice(1).filter((x, i) => {
+      const prev = sorted[i];
+      const referenceGap = Math.abs(x.value - prev.value);
+      const betweenCapitals = haversineKm(x, prev);
+      return referenceGap < 125 && betweenCapitals > 1800;
+    }).length;
+    if (enhancedRules && artificialCoinFlips > 0) continue;
+
     const closeCalls = gaps.filter(g => g < 650).length;
     const veryClose = gaps.filter(g => g < 350).length;
     const latSpread = Math.max(...items.map(i => i.lat)) - Math.min(...items.map(i => i.lat));
     const lngSpread = Math.max(...items.map(i => i.lng)) - Math.min(...items.map(i => i.lng));
     const tooObviousExtremes = gaps[0] > 1500 || gaps[gaps.length-1] > 2500;
-    const quality = closeCalls*12 + veryClose*8 + Math.min(latSpread, 110)/10 + Math.min(lngSpread, 220)/18 - (tooObviousExtremes ? 22 : 0);
+
+    const knownAnchorBonus = enhancedRules ? items.filter(i => i.difficulty === "easy").length * 8 : 0;
+    const quality = closeCalls*12 + veryClose*8 + knownAnchorBonus + Math.min(latSpread, 110)/10 + Math.min(lngSpread, 220)/18 - (tooObviousExtremes ? 22 : 0);
     if (!best || quality > best.quality) best = {items, sorted, quality};
   }
+
+  if (!best) {
+    // Fallback: keep the app usable even if strict validation rejects too many candidates.
+    const candidates = shuffle(COUNTRIES_CLEAN.filter(c => c.country !== reference.country && !excludeCountries.has(c.country)), rng).slice(0, 10);
+    const items = candidates.map(c => ({...c, value: haversineKm(reference, c)}));
+    best = { items, sorted: [...items].sort((a,b) => a.value - b.value), quality: 0 };
+  }
+
   return makePuzzleObject({
     type: "distance",
     icon: "🌍",
@@ -212,7 +271,7 @@ function difficultySample(rng, pattern, excludeCountries = new Set()) {
   };
   let picked = [];
   for (const [diff, count] of Object.entries(pattern)) picked.push(...shuffle(buckets[diff] || [], rng).slice(0, count));
-  while (picked.length < 10) picked.push(sample(COUNTRIES_CLEAN, rng));
+  while (picked.length < 10) picked.push(sample(COUNTRIES_CLEAN.filter(c => !excludeCountries.has(c.country)), rng));
   picked = [...new Map(picked.map(x => [x.country, x])).values()];
   while (picked.length < 10) {
     const candidate = sample(COUNTRIES_CLEAN.filter(c => !excludeCountries.has(c.country)), rng);
@@ -223,7 +282,7 @@ function difficultySample(rng, pattern, excludeCountries = new Set()) {
 function makeCapitalAZPuzzle(rng, excludeCountries = new Set()) {
   let best = null;
   for (let attempt = 0; attempt < 500; attempt++) {
-    const items = difficultySample(rng, { easy: 1, medium: 4, hard: 4, veryHard: 1 }, excludeCountries);
+    const items = difficultySample(rng, { easy: 4, medium: 4, hard: 2, veryHard: 0 }, excludeCountries);
     if (!passesOceaniaLimit(items)) continue;
     const sorted = [...items].sort((a,b) => alphabetValue(a.capital).localeCompare(alphabetValue(b.capital)));
     const initials = new Set(items.map(i => alphabetValue(i.capital)[0]));
@@ -257,7 +316,7 @@ function similarFlagBonus(items) {
 function makeFlagsCapitalAZPuzzle(rng, excludeCountries = new Set()) {
   let best = null;
   for (let attempt = 0; attempt < 800; attempt++) {
-    const items = difficultySample(rng, { easy: 1, medium: 3, hard: 4, veryHard: 2 }, excludeCountries);
+    const items = difficultySample(rng, { easy: 4, medium: 3, hard: 3, veryHard: 0 }, excludeCountries);
     if (!passesOceaniaLimit(items)) continue;
     if (hasForbiddenFlagPair(items)) continue;
     const sorted = [...items].sort((a,b) => alphabetValue(a.capital).localeCompare(alphabetValue(b.capital)));
@@ -328,6 +387,15 @@ function makePuzzle(puzzleNo) {
   const rng = mulberry32(hashString(`GeoRank:${puzzleNo}:v0.2`));
   const category = getCategoryForPuzzleNo(puzzleNo);
   const excludeCountries = previousDayCountryCooldown(puzzleNo);
+
+  // Keep already-live puzzles unchanged. New exclusion rules only apply from GeoRank #3 onwards.
+  if (puzzleNo >= GENERATOR_RULE_CHANGE_PUZZLE_NO) {
+    GLOBAL_EXCLUDED_COUNTRIES.forEach(country => excludeCountries.add(country));
+    if (category === "flagsCapitalAZ") {
+      FLAG_DAY_EXCLUDED_COUNTRIES.forEach(country => excludeCountries.add(country));
+    }
+  }
+
   let made;
   if (category === "distance") made = makeDistancePuzzle(rng, puzzleNo, excludeCountries);
   else if (category === "capitalAZ") made = makeCapitalAZPuzzle(rng, excludeCountries);
